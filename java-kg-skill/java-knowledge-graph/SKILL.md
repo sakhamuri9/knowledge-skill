@@ -126,7 +126,8 @@ any node for its callers/callees.
 d=3 MAY NEED TESTING.
 
 **Edge confidence:** 1.0 exact (inheritance, instantiation) · 0.8–0.9
-type-resolved calls · 0.6 dynamic dispatch through an interface/override ·
+type-resolved calls · 0.75 single-implementation dispatch · 0.5–0.6
+multi-implementation dynamic dispatch · 0.7 async topic match ·
 0.35–0.5 name-based fallback (verify by reading the call site before
 relying on it).
 
@@ -135,9 +136,37 @@ overridden, callers may bind via dependency injection at runtime — treat
 the result as a **lower bound** and say so when reporting.
 
 **Flows:** entry points are `main` methods, Spring/Jakarta endpoints
-(`@GetMapping`, `@RequestMapping`, …), schedulers, and message listeners.
+(`@GetMapping`, `@RequestMapping`, …), schedulers, and message listeners
+(`@KafkaListener`, `@JmsListener`, `@RabbitListener`, `@SqsListener`).
 A flow is the longest call chain from an entry point to a terminal — the
 fastest way to understand a feature end-to-end.
+
+## Big-repo accuracy (what makes flows survive real codebases)
+
+- **Interface / abstract-class boundaries:** `DISPATCHES_TO` edges connect
+  every interface/abstract method to its implementations (transitively
+  through abstract bases), so a layered chain like
+  `Controller → ServiceInterface → ServiceImpl → AbstractProcessor →
+  ConcreteProcessor` traces end-to-end instead of dead-ending. `context`
+  shows these as "Dispatches to".
+- **Generated code:** Lombok (`@Data`/`@Getter`/`@Builder`/constructors) and
+  Spring Data repository CRUD methods (`save`, `findById`, … on interfaces
+  extending `JpaRepository`/`CrudRepository`/…) are synthesized into the
+  graph, so calls to them resolve instead of silently disappearing.
+- **Async messaging (Kafka / JMS / Rabbit / SQS):** producer calls
+  (`kafkaTemplate.send("topic", …)`, `jmsTemplate.convertAndSend`) are
+  matched to listener methods by topic key — `PUBLISHES_TO` edges let flows
+  and impact analysis cross the messaging boundary. `context` shows
+  "Publishes to" / "Consumes from".
+- **External dependency classes:** calls into imported library types are
+  recorded as `USES_EXTERNAL` edges (`context` lists them under "External
+  dependencies") so you can see exactly where execution leaves the repo.
+- **Duplicate names across modules:** ambiguous simple names resolve by
+  package proximity (longest shared package prefix wins); genuinely
+  ambiguous references are dropped, never guessed.
+- **Scale:** flow count and trace depth scale with repo size (up to 400
+  flows, depth 14); parsing fans out across CPU cores when ≥64 files
+  changed. Re-`analyze` is always incremental.
 
 See `reference/SCHEMA.md` for the full node/edge schema and `.jkg/graph.json`
 layout (only needed when querying the JSON directly with `--json`).

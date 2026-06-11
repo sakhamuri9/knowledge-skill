@@ -3,7 +3,7 @@
 jkg.py — Java Knowledge Graph
 A zero-dependency code-graph indexer & query engine for Java codebases.
 
-Builds a GitNexus-style knowledge graph (classes, interfaces, methods, calls,
+Builds a code knowledge graph (classes, interfaces, methods, calls,
 inheritance, execution flows, functional clusters) and stores it as plain JSON
 in <repo>/.jkg/ — no database required.
 
@@ -35,7 +35,8 @@ import argparse
 import time
 from collections import defaultdict, Counter
 
-SCHEMA_VERSION = 2  # v2: field annotations + Lombok synthesis
+SCHEMA_VERSION = 3  # v3: dispatch edges, Spring Data synthesis, externals,
+                    #     abstract-type flags, package-proximity resolution
 JKG_DIR = ".jkg"
 GRAPH_FILE = "graph.json"
 CACHE_FILE = "parse-cache.json"
@@ -67,14 +68,29 @@ ENTRY_METHOD_ANNOS = {
 }
 ENTRY_CLASS_ANNOS = {"RestController", "Controller", "RestControllerAdvice",
                      "ControllerAdvice", "WebServlet", "SpringBootApplication"}
+
+# Async messaging (Kafka / JMS / Rabbit / SQS): consumer-side annotations and
+# producer-side send methods. Producer calls are matched to listeners by
+# topic/destination/queue key so flows continue across the async boundary.
+LISTENER_ANNOS = {"KafkaListener", "JmsListener", "RabbitListener",
+                  "SqsListener", "KafkaHandler", "RabbitHandler"}
+SEND_METHODS = {"send", "sendDefault", "convertAndSend", "publish",
+                "sendAndReceive", "convertSendAndReceive"}
+LISTENER_ARG_KEYS = re.compile(
+    r'"([^"]+)"|(?<![.\w])([A-Z][\w$]*(?:\.[A-Z_][\w$]*)+)')
+LISTENER_ANNO_RE = re.compile(
+    r'@(' + '|'.join(sorted(LISTENER_ANNOS)) + r')\s*\(')
 TEST_ANNOS = {"Test", "ParameterizedTest", "RepeatedTest", "BeforeEach",
               "AfterEach", "BeforeAll", "AfterAll"}
 
-# Process detection config (mirrors GitNexus defaults)
-MAX_TRACE_DEPTH = 10
+# Process detection config (scales up on big repos)
+MAX_TRACE_DEPTH = 14          # layered repos: controller→iface→impl→repo→…
 MAX_BRANCHING = 4
-MAX_PROCESSES = 75
+MAX_PROCESSES = 75            # floor; grows with method count, capped below
+MAX_PROCESSES_CAP = 400
+DFS_STEP_BUDGET = 9000
 MIN_STEPS = 3
+PARALLEL_PARSE_MIN = 64       # use a process pool above this many changed files
 
 # ---------------------------------------------------------------------------
 # Source cleaning
@@ -231,7 +247,51 @@ def modifiers_before(text, pos):
     return set(w for w in seg.split() if w in MODIFIER_WORDS)
 
 
-def extract_calls(body, line_base_text, body_start):
+def _send_key(text, orig, open_pos):
+    """First topic/destination key in a producer call's argument list:
+    a string literal or a CONSTANT.REFERENCE (read from the original
+    source — literals are blanked in the stripped text)."""
+    d, j = 0, open_pos
+    end = min(len(text), open_pos + 300)
+    while j < end:
+        if text[j] == '(':
+            d += 1
+        elif text[j] == ')':
+            d -= 1
+            if d == 0:
+                break
+        j += 1
+    m = LISTENER_ARG_KEYS.search(orig[open_pos + 1:j])
+    return (m.group(1) or m.group(2)) if m else None
+
+
+def listener_topics(text, orig, region_start, pos):
+    """Topic/queue/destination keys from @KafkaListener/@JmsListener/…
+    annotations preceding a method declaration."""
+    lo = max(region_start, pos - 400)
+    seg = text[lo:pos]
+    cut = max(seg.rfind(';'), seg.rfind('}'))
+    base = lo + cut + 1 if cut != -1 else lo
+    keys = []
+    for am in LISTENER_ANNO_RE.finditer(text, base, pos):
+        o = am.end() - 1  # '(' position
+        d, j = 0, o
+        while j < pos:
+            if text[j] == '(':
+                d += 1
+            elif text[j] == ')':
+                d -= 1
+                if d == 0:
+                    break
+            j += 1
+        for qm in LISTENER_ARG_KEYS.finditer(orig[o + 1:j]):
+            k = qm.group(1) or qm.group(2)
+            if k:
+                keys.append(k)
+    return keys
+
+
+def extract_calls(body, line_base_text, body_start, orig=None):
     calls = []
     for m in CALL_RE.finditer(body):
         pos = body_start + m.start()
@@ -242,7 +302,12 @@ def extract_calls(body, line_base_text, body_start):
             recv, name = m.group(2), m.group(3)
             if name in JAVA_KEYWORDS:
                 continue
-            calls.append({"k": "recv", "recv": recv, "name": name, "line": ln})
+            c = {"k": "recv", "recv": recv, "name": name, "line": ln}
+            if orig and name in SEND_METHODS:
+                key = _send_key(line_base_text, orig, body_start + m.end() - 1)
+                if key:
+                    c["topic"] = key
+            calls.append(c)
         elif m.group(4):  # ).chained(
             name = m.group(4)
             if name not in JAVA_KEYWORDS:
@@ -269,6 +334,7 @@ def extract_locals(body):
 
 def parse_java(src, rel_path):
     """Parse one Java source file into a declaration record (JSON-friendly)."""
+    orig = src
     text = strip_noise(src)
     pkg_m = PKG_RE.search(text)
     package = pkg_m.group(1) if pkg_m else ""
@@ -311,6 +377,7 @@ def parse_java(src, rel_path):
             "kind": kind, "name": name, "start": m.start(), "open": body_open,
             "close": body_close, "extends": ext, "implements": impl,
             "annotations": annotations_before(text, 0, m.start()),
+            "abstract": "abstract" in modifiers_before(text, m.start()),
             "line": line_of(text, m.start()), "rec_params": rec_params,
         })
 
@@ -419,19 +486,24 @@ def parse_java(src, rel_path):
                 bclose = match_brace(text, body_open_pos)
                 body_span = (body_open_pos, bclose)
                 body = text[body_open_pos:bclose + 1]
-                calls = extract_calls(body, text, body_open_pos)
+                calls = extract_calls(body, text, body_open_pos, orig)
                 locs = extract_locals(body)
             if any(s[0] <= name_pos < s[1] for s in seen_spans):
                 continue
             if body_span:
                 seen_spans.append(body_span)
-            methods.append({
+            rec = {
                 "name": name, "arity": len(params), "params": params,
                 "line": line_of(text, name_pos), "annotations": annos,
                 "static": "static" in mods, "abstract": after_ws.startswith(';'),
                 "public": "public" in mods or t["kind"] == "interface",
                 "ctor": False, "calls": calls, "locals": locs,
-            })
+            }
+            if annos and set(annos) & LISTENER_ANNOS:
+                topics = listener_topics(text, orig, body_lo, m.start(2))
+                if topics:
+                    rec["topics"] = topics
+            methods.append(rec)
 
         # constructors: Name(
         ctor_re = re.compile(r'(?<![\w$.])(' + re.escape(t["name"]) + r')\s*\(')
@@ -472,7 +544,8 @@ def parse_java(src, rel_path):
                 "line": line_of(text, name_pos),
                 "annotations": annotations_before(text, body_lo, name_pos),
                 "static": False, "abstract": False, "public": "public" in mods,
-                "ctor": True, "calls": extract_calls(body, text, body_open_pos),
+                "ctor": True,
+                "calls": extract_calls(body, text, body_open_pos, orig),
                 "locals": extract_locals(body),
             })
 
@@ -501,7 +574,8 @@ def parse_java(src, rel_path):
         types.append({
             "name": t["name"], "qname": qname_of(t), "kind": t["kind"],
             "line": t["line"], "extends": t["extends"], "implements": t["implements"],
-            "annotations": t["annotations"], "methods": methods, "fields": fields,
+            "annotations": t["annotations"], "abstract": t["abstract"],
+            "methods": methods, "fields": fields,
         })
 
     return {"package": package, "imports": imports, "wildcards": wildcards,
@@ -510,7 +584,7 @@ def parse_java(src, rel_path):
 # ---------------------------------------------------------------------------
 # Lombok synthesis — materialize the methods Lombok generates at compile time
 # so calls like order.getId() resolve on @Data/@Getter/@Builder classes.
-# (GitNexus does not do this; tree-sitter only sees declared methods.)
+# (AST parsers only see declared methods; these exist only after compilation.)
 # ---------------------------------------------------------------------------
 
 LOMBOK_GETTER = {"Getter", "Data", "Value"}
@@ -519,8 +593,8 @@ LOMBOK_ALL_ARGS = {"AllArgsConstructor", "Value", "Builder"}
 
 
 def synthesize_lombok(td):
-    """Append synthetic method records for Lombok-generated members."""
-    td["methods"] = [m for m in td["methods"] if not m.get("synthetic")]
+    """Append synthetic method records for Lombok-generated members.
+    Caller must strip previous synthetic records first (build pass 0)."""
     annos = set(td["annotations"])
     existing = {(m["name"], m["arity"]) for m in td["methods"]}
     synth = []
@@ -562,6 +636,56 @@ def synthesize_lombok(td):
 
 
 # ---------------------------------------------------------------------------
+# Spring Data synthesis — repository interfaces inherit their CRUD methods
+# from library base interfaces (JpaRepository etc.) that aren't in the repo,
+# so calls like orderRepository.save(order) would otherwise resolve to nothing.
+# ---------------------------------------------------------------------------
+
+SPRING_DATA_BASES = {
+    "Repository", "CrudRepository", "ListCrudRepository",
+    "PagingAndSortingRepository", "ListPagingAndSortingRepository",
+    "JpaRepository", "MongoRepository", "CassandraRepository",
+    "ElasticsearchRepository", "Neo4jRepository", "CouchbaseRepository",
+    "ReactiveCrudRepository", "ReactiveMongoRepository", "R2dbcRepository",
+    "CoroutineCrudRepository",
+}
+
+SPRING_DATA_METHODS = [
+    ("save", 1), ("saveAll", 1), ("saveAndFlush", 1),
+    ("findById", 1), ("getById", 1), ("getReferenceById", 1), ("getOne", 1),
+    ("findAll", 0), ("findAllById", 1), ("existsById", 1), ("count", 0),
+    ("deleteById", 1), ("delete", 1), ("deleteAll", 0), ("deleteAllById", 1),
+    ("deleteAllInBatch", 0), ("flush", 0),
+]
+
+
+def synthesize_spring_data(td):
+    """Append synthetic CRUD method records to Spring Data repository
+    interfaces so calls to inherited library methods resolve."""
+    if td["kind"] != "interface":
+        return False
+    bases = {strip_generics(s).strip().split('.')[-1]
+             for s in td["extends"] + td["implements"]}
+    if not bases & SPRING_DATA_BASES:
+        return False
+    existing = {(m["name"], m["arity"]) for m in td["methods"]}
+    synth = []
+    for name, arity in SPRING_DATA_METHODS:
+        if (name, arity) in existing:
+            continue
+        existing.add((name, arity))
+        synth.append({"name": name, "arity": arity,
+                      "params": [{"type": "Object", "name": "arg%d" % i}
+                                 for i in range(arity)],
+                      "line": td["line"], "annotations": [],
+                      "static": False, "abstract": False, "public": True,
+                      "ctor": False, "calls": [], "locals": {},
+                      "synthetic": "spring-data"})
+    td["methods"].extend(synth)
+    return bool(synth)
+
+
+# ---------------------------------------------------------------------------
 # Graph construction
 # ---------------------------------------------------------------------------
 
@@ -584,6 +708,8 @@ class GraphBuilder:
         self.type_by_qname = {}
         self.simple_index = defaultdict(list)   # simpleName -> [qname]
         self.method_name_index = defaultdict(list)  # name -> [method ids]
+        self.overrides_of = defaultdict(list)   # super method id -> [impl ids]
+        self.listeners = defaultdict(list)      # topic key -> [listener mids]
 
     # -- node helpers -------------------------------------------------------
     def add_type_node(self, file, td):
@@ -595,6 +721,7 @@ class GraphBuilder:
             "file": file, "line": td["line"], "pkg": td["qname"].rsplit('.', 1)[0]
             if '.' in td["qname"] else "",
             "annotations": td["annotations"],
+            "abstract": td.get("abstract", False) or td["kind"] == "interface",
         }
         self.type_by_qname[td["qname"]] = (file, td)
         self.simple_index[td["name"]].append(td["qname"])
@@ -615,6 +742,10 @@ class GraphBuilder:
         }
         if m.get("synthetic"):
             self.nodes[mid]["synthetic"] = m["synthetic"]
+        if m.get("topics"):
+            self.nodes[mid]["topics"] = m["topics"]
+            for key in m["topics"]:
+                self.listeners[key].append(mid)
         self.method_name_index[m["name"]].append(mid)
         return mid
 
@@ -623,6 +754,26 @@ class GraphBuilder:
                            "conf": round(conf, 2), "reason": reason})
 
     # -- type resolution ------------------------------------------------------
+    def _disambig(self, hits, pkg):
+        """Pick among same-simple-name candidates by package proximity.
+        Big repos routinely have e.g. three `Order` classes in different
+        modules — prefer the one sharing the longest package prefix."""
+        if not hits:
+            return None
+        if len(hits) == 1:
+            return hits[0]
+        def shared(q):
+            qp = q.rsplit('.', 1)[0] if '.' in q else ""
+            pa, pb = pkg.split('.'), qp.split('.')
+            i = 0
+            while i < len(pa) and i < len(pb) and pa[i] == pb[i]:
+                i += 1
+            return i
+        ranked = sorted(hits, key=lambda q: (-shared(q), q))
+        if shared(ranked[0]) > 0 and shared(ranked[0]) > shared(ranked[1]):
+            return ranked[0]
+        return None  # genuinely ambiguous — don't guess
+
     def resolve_type(self, name, file_rec, owner_qname):
         if not name or name in JAVA_KEYWORDS:
             return None
@@ -642,8 +793,7 @@ class GraphBuilder:
                 if cand in self.type_by_qname:
                     return cand
             last = name.split('.')[-1]
-            hits = self.simple_index.get(last, [])
-            return hits[0] if len(hits) == 1 else None
+            return self._disambig(self.simple_index.get(last, []), pkg)
         # nested in owner chain
         oq = owner_qname
         while oq:
@@ -663,8 +813,7 @@ class GraphBuilder:
             cand = w + "." + name
             if cand in self.type_by_qname:
                 return cand
-        hits = self.simple_index.get(name, [])
-        return hits[0] if len(hits) == 1 else None
+        return self._disambig(self.simple_index.get(name, []), pkg)
 
     def supertypes(self, qname):
         """Internal supertype qnames (extends + implements), one level."""
@@ -708,12 +857,17 @@ class GraphBuilder:
 
     # -- main build -----------------------------------------------------------
     def build(self):
-        # pass 0: materialize Lombok-generated members (idempotent)
+        # pass 0: materialize compiler/framework-generated members (idempotent)
         self.lombok_types = 0
+        self.springdata_types = 0
         for file in sorted(self.cache):
             for td in self.cache[file]["parsed"]["types"]:
+                td["methods"] = [m for m in td["methods"]
+                                 if not m.get("synthetic")]
                 if synthesize_lombok(td):
                     self.lombok_types += 1
+                if synthesize_spring_data(td):
+                    self.springdata_types += 1
         # pass 1: nodes
         for file in sorted(self.cache):
             parsed = self.cache[file]["parsed"]
@@ -761,9 +915,20 @@ class GraphBuilder:
                     for sup in self.supertypes(td["qname"]):
                         r = self.find_method(sup, m["name"], m["arity"])
                         if r:
-                            self.edge(self.method_id(td["qname"], m), r[0],
-                                      "OVERRIDES", 0.85)
+                            mid = self.method_id(td["qname"], m)
+                            self.edge(mid, r[0], "OVERRIDES", 0.85)
+                            self.overrides_of[r[0]].append(mid)
                             break
+
+        # pass 3.5: DISPATCHES_TO edges — an interface/abstract method
+        # "executes as" its overriding implementations at runtime. These
+        # edges let execution flows and impact analysis continue through
+        # the interface boundary instead of dead-ending on the abstract
+        # declaration (critical for layered enterprise codebases).
+        for target, impls in sorted(self.overrides_of.items()):
+            conf = 0.9 if len(impls) == 1 else 0.6
+            for im in sorted(impls):
+                self.edge(target, im, "DISPATCHES_TO", conf, "implementation")
 
         # pass 4: CALLS edges
         for file in sorted(self.cache):
@@ -779,6 +944,21 @@ class GraphBuilder:
 
         return self
 
+    def _impls_of(self, mid, cap=9):
+        """Transitive overriding implementations of a method (BFS through
+        the overrides chain: interface -> abstract base -> concrete)."""
+        out, stack, seen = [], [mid], {mid}
+        while stack:
+            cur = stack.pop()
+            for im in self.overrides_of.get(cur, ()):
+                if im not in seen:
+                    seen.add(im)
+                    out.append(im)
+                    stack.append(im)
+                    if len(out) >= cap:
+                        return out
+        return out
+
     def _link_method(self, src, owner_q, name, conf, reason, dispatch=True):
         r = self.find_method(owner_q, name, -1)  # arity unknown: loose match
         linked = False
@@ -788,23 +968,49 @@ class GraphBuilder:
                       reason)
             linked = True
             # dynamic dispatch: an interface/abstract method may execute any
-            # override in a subtype — link those too (GitNexus: METHOD_IMPLEMENTS)
+            # override — link the caller to implementations directly so the
+            # blast radius shows them at depth 1. Transitive (iface -> abstract
+            # base -> concrete). A single implementation is near-certain.
             if dispatch:
-                owner_of_found = mid.split('#')[0]
-                impls = self.subtypes.get(owner_of_found, [])
-                if impls and len(impls) <= 6:
-                    for st in sorted(impls):
-                        ri = self.find_method(st, name, -1, _seen={owner_of_found})
-                        if ri and ri[0] != mid:
-                            self.edge(src, ri[0], "CALLS", 0.6,
-                                      "dynamic-dispatch via " +
-                                      owner_of_found.split('.')[-1])
+                impls = self._impls_of(mid)
+                owner_simple = mid.split('#')[0].split('.')[-1]
+                if len(impls) == 1:
+                    self.edge(src, impls[0], "CALLS", 0.75,
+                              "single-impl dispatch via " + owner_simple)
+                elif 1 < len(impls) <= 8:
+                    for ri in sorted(impls):
+                        self.edge(src, ri, "CALLS", 0.5,
+                                  "dynamic-dispatch via " + owner_simple)
+                # >8 impls: skip direct caller->impl edges (noise); flows
+                # still continue through the DISPATCHES_TO edges.
         return linked
+
+    def _external(self, src, file_rec, simple_name):
+        """Record a dependency on an imported library type (dependency class).
+        Keeps the boundary visible: context/impact can show where execution
+        leaves the repo instead of silently dropping the call."""
+        fqn = file_rec["imports"].get(simple_name)
+        if not fqn or fqn.startswith("java."):
+            return  # JDK noise — track real dependencies only
+        nid = "ext:" + fqn
+        if nid not in self.nodes:
+            self.nodes[nid] = {"id": nid, "kind": "External",
+                               "name": simple_name, "qname": fqn,
+                               "file": "", "line": 0,
+                               "pkg": fqn.rsplit('.', 1)[0]}
+        self.edge(src, nid, "USES_EXTERNAL", 0.9, "library")
 
     def _resolve_calls(self, src, td, m, env, file_rec):
         own_q = td["qname"]
         for c in m["calls"]:
             k = c["k"]
+            # async boundary: producer send("topic") -> @KafkaListener et al.
+            topic = c.get("topic")
+            if topic:
+                for lm in sorted(set(self.listeners.get(topic, ()))):
+                    if lm != src:
+                        self.edge(src, lm, "PUBLISHES_TO", 0.7,
+                                  "topic:" + topic)
             if k == "new":
                 tq = self.resolve_type(c["name"], file_rec, own_q)
                 if tq:
@@ -813,6 +1019,8 @@ class GraphBuilder:
                         self.edge(src, r[0], "CALLS", 0.95, "instantiation")
                     else:
                         self.edge(src, tq, "INSTANTIATES", 0.95)
+                else:
+                    self._external(src, file_rec, c["name"].split('.')[-1])
             elif k == "bare":
                 if c["name"] == td["name"]:
                     continue
@@ -833,8 +1041,10 @@ class GraphBuilder:
                     if tq:
                         self._link_method(src, tq, name, 0.8,
                                           "var:" + recv)
-                    # else: receiver type is external (JDK/library) —
-                    # the call leaves the repo, don't guess by name
+                    else:
+                        # receiver type is external (JDK/library) — record
+                        # the dependency boundary, don't guess by name
+                        self._external(src, file_rec, env[recv])
                 elif recv[0:1].isupper():
                     tq = self.resolve_type(recv, file_rec, own_q)
                     if tq:
@@ -842,7 +1052,7 @@ class GraphBuilder:
                     elif recv in file_rec["imports"] or any(
                             recv == w.split('.')[-1]
                             for w in file_rec["wildcards"]):
-                        pass  # imported external type — call leaves the repo
+                        self._external(src, file_rec, recv)
                     else:
                         self._fallback(src, name)
                 else:
@@ -952,9 +1162,16 @@ def detect_processes(nodes, edges, member_cluster):
     calls_out = defaultdict(list)
     calls_in = defaultdict(set)
     for e in edges:
-        if e["type"] == "CALLS":
+        # DISPATCHES_TO lets a trace step from an interface/abstract method
+        # into its implementations; PUBLISHES_TO stitches producer -> consumer
+        # across Kafka/JMS/Rabbit topics — flows survive both boundaries
+        if e["type"] in ("CALLS", "DISPATCHES_TO", "PUBLISHES_TO"):
             calls_out[e["src"]].append((e["dst"], e["conf"]))
             calls_in[e["dst"]].add(e["src"])
+
+    n_methods = sum(1 for n in nodes.values()
+                    if n["kind"] in ("Method", "Constructor"))
+    max_processes = min(MAX_PROCESSES_CAP, max(MAX_PROCESSES, n_methods // 20))
 
     def is_test(nid):
         n = nodes[nid]
@@ -979,17 +1196,17 @@ def detect_processes(nodes, edges, member_cluster):
         if reason:
             entries.append((nid, reason))
     # secondary: public zero-caller methods with real fan-out
-    if len(entries) < MAX_PROCESSES:
+    if len(entries) < max_processes:
         extra = []
         seeded = {e for e, _ in entries}
         for nid in sorted(nodes):
             n = nodes[nid]
             if (n["kind"] == "Method" and n.get("public") and nid not in seeded
                     and not calls_in.get(nid) and calls_out.get(nid)
-                    and not is_test(nid)):
+                    and not is_test(nid) and not n.get("abstract")):
                 extra.append((nid, len(calls_out[nid])))
         extra.sort(key=lambda kv: (-kv[1], kv[0]))
-        for nid, _ in extra[:MAX_PROCESSES - len(entries)]:
+        for nid, _ in extra[:max_processes - len(entries)]:
             entries.append((nid, "entry"))
 
     processes = {}
@@ -998,7 +1215,7 @@ def detect_processes(nodes, edges, member_cluster):
         best = [entry]
         stack = [(entry, [entry])]
         steps = 0
-        while stack and steps < 4000:
+        while stack and steps < DFS_STEP_BUDGET:
             steps += 1
             cur, path = stack.pop()
             if len(path) > len(best):
@@ -1033,7 +1250,7 @@ def detect_processes(nodes, edges, member_cluster):
                 "clusters": sorted(cl),
             }
     plist = sorted(processes.values(), key=lambda p: (-p["stepCount"], p["label"]))
-    plist = plist[:MAX_PROCESSES]
+    plist = plist[:max_processes]
     for i, p in enumerate(plist):
         p["id"] = "P%d" % (i + 1)
     return plist
@@ -1084,6 +1301,18 @@ def find_java_files(root):
 # Commands
 # ---------------------------------------------------------------------------
 
+def _parse_one(job):
+    """Worker: read + parse one file. Module-level so it pickles for the
+    multiprocessing pool used on large repos."""
+    root, rel = job
+    try:
+        with open(os.path.join(root, rel), 'r', encoding='utf-8',
+                  errors='replace') as f:
+            return rel, parse_java(f.read(), rel), None
+    except Exception as ex:
+        return rel, None, str(ex)
+
+
 def cmd_analyze(root, quiet=False):
     t0 = time.time()
     cache_path = os.path.join(jkg_path(root), CACHE_FILE)
@@ -1091,7 +1320,7 @@ def cmd_analyze(root, quiet=False):
     if old.get("schema") != SCHEMA_VERSION:
         old = {"files": {}}
     files = find_java_files(root)
-    cache, parsed_new, kept, repo_bytes = {}, 0, 0, 0
+    cache, kept, repo_bytes, to_parse = {}, 0, 0, []
     for rel in files:
         full = os.path.join(root, rel)
         try:
@@ -1104,14 +1333,32 @@ def cmd_analyze(root, quiet=False):
             cache[rel] = prev
             kept += 1
         else:
-            try:
-                with open(full, 'r', encoding='utf-8', errors='replace') as f:
-                    src = f.read()
-                cache[rel] = {"hash": h, "parsed": parse_java(src, rel)}
-                parsed_new += 1
-            except Exception as ex:
-                sys.stderr.write("warn: failed to parse %s: %s\n" % (rel, ex))
-    removed = len(set(old["files"]) - set(cache))
+            to_parse.append((rel, h))
+    removed = len(set(old["files"]) - set(cache) -
+                  {rel for rel, _ in to_parse})
+
+    hashes = dict(to_parse)
+    results = None
+    if len(to_parse) >= PARALLEL_PARSE_MIN:
+        try:  # big repo: parse across cores; falls back to serial on failure
+            import multiprocessing as mp
+            workers = min(8, mp.cpu_count() or 1)
+            if workers > 1:
+                with mp.Pool(workers) as pool:
+                    results = pool.map(_parse_one,
+                                       [(root, rel) for rel, _ in to_parse],
+                                       chunksize=16)
+        except Exception:
+            results = None
+    if results is None:
+        results = [_parse_one((root, rel)) for rel, _ in to_parse]
+    parsed_new = 0
+    for rel, parsed, err in results:
+        if err is not None:
+            sys.stderr.write("warn: failed to parse %s: %s\n" % (rel, err))
+            continue
+        cache[rel] = {"hash": hashes[rel], "parsed": parsed}
+        parsed_new += 1
 
     gb = GraphBuilder(root, cache).build()
     clusters = detect_clusters(gb.nodes, gb.edges)
@@ -1156,6 +1403,18 @@ def cmd_analyze(root, quiet=False):
             print("  ◆ Lombok detected on %d type(s) — generated "
                   "getters/setters/builders synthesized into the graph"
                   % gb.lombok_types)
+        if gb.springdata_types:
+            print("  ◆ Spring Data: %d repository interface(s) — inherited "
+                  "CRUD methods (save/findById/…) synthesized"
+                  % gb.springdata_types)
+        n_disp = sum(1 for e in gb.edges if e["type"] == "DISPATCHES_TO")
+        if n_disp:
+            print("  ◆ %d interface/abstract → implementation dispatch "
+                  "edge(s) — flows continue through type boundaries" % n_disp)
+        n_pub = sum(1 for e in gb.edges if e["type"] == "PUBLISHES_TO")
+        if n_pub:
+            print("  ◆ %d async messaging edge(s) (Kafka/JMS/Rabbit) — "
+                  "producer→listener flows stitched by topic" % n_pub)
         print("  " + token_economics(repo_bytes))
     return graph
 
@@ -1425,6 +1684,29 @@ def cmd_context(root, ref):
     ov_in = [e["src"] for s in seeds for e in g.in_edges[s] if e["type"] == "OVERRIDES"]
     if ov_in:
         print("\nOverridden by: " + ", ".join(sorted({g.display(o) for o in ov_in})))
+    disp_to = [e["dst"] for s in seeds for e in g.out_edges[s]
+               if e["type"] == "DISPATCHES_TO"]
+    if disp_to:
+        print("Dispatches to:  " + ", ".join(sorted({g.display(d)
+                                                     for d in disp_to})))
+    pubs = [(e["dst"], e.get("reason", "")) for s in seeds
+            for e in g.out_edges[s] if e["type"] == "PUBLISHES_TO"]
+    if pubs:
+        print("\nPublishes to (async messaging):")
+        for dst, why in sorted(set(pubs)):
+            print("  ⇉ %-40s %s" % (g.display(dst), why))
+    subs = [(e["src"], e.get("reason", "")) for s in seeds
+            for e in g.in_edges[s] if e["type"] == "PUBLISHES_TO"]
+    if subs:
+        print("\nConsumes from (async messaging):")
+        for src_, why in sorted(set(subs)):
+            print("  ⇇ %-40s %s" % (g.display(src_), why))
+    exts = sorted({g.nodes[e["dst"]]["qname"] for s in seeds
+                   for e in g.out_edges[s] if e["type"] == "USES_EXTERNAL"})
+    if exts:
+        print("\nExternal dependencies (calls leave the repo here):")
+        for x in exts[:10]:
+            print("  ⇢ %s" % x)
 
     procs = {}
     for s in seeds:
@@ -1441,7 +1723,8 @@ def _bfs_impact(g, seeds, direction, max_depth, conf_floor=0.3):
     visited = {s: 0 for s in seeds}
     frontier = list(seeds)
     by_depth = defaultdict(list)
-    rel = ("CALLS", "INSTANTIATES", "OVERRIDES", "EXTENDS", "IMPLEMENTS")
+    rel = ("CALLS", "INSTANTIATES", "OVERRIDES", "EXTENDS", "IMPLEMENTS",
+           "DISPATCHES_TO", "PUBLISHES_TO")
     for d in range(1, max_depth + 1):
         nxt = []
         for cur in frontier:
@@ -1684,7 +1967,7 @@ def cmd_cycles(root):
 
 
 def cmd_diff(root):
-    """Like GitNexus detect_changes(): what changed since the last analyze."""
+    """Change detection: what changed since the last analyze."""
     cache_path = os.path.join(jkg_path(root), CACHE_FILE)
     old = load_json(cache_path)
     if not old:
@@ -1780,8 +2063,18 @@ def cmd_stats(root):
     print("Knowledge graph for %s" % g.data["root"])
     print("  indexed:  %s  (schema v%d)" % (g.data["indexedAt"], g.data["schema"]))
     print("  files:    %d" % s["files"])
-    print("  types:    %d   methods: %d   nodes: %d" % (s["types"], s["methods"],
-                                                        s["nodes"]))
+    kinds = Counter(n["kind"] for n in g.nodes.values())
+    n_abs = sum(1 for n in g.nodes.values()
+                if n["kind"] == "Class" and n.get("abstract"))
+    print("  types:    %d   (%d classes [%d abstract] · %d interfaces · "
+          "%d enums · %d records)"
+          % (s["types"], kinds.get("Class", 0), n_abs,
+             kinds.get("Interface", 0), kinds.get("Enum", 0),
+             kinds.get("Record", 0)))
+    if kinds.get("External"):
+        print("  external dependency classes referenced: %d"
+              % kinds["External"])
+    print("  methods:  %d   nodes: %d" % (s["methods"], s["nodes"]))
     print("  edges:    %d" % s["edges"])
     by_type = Counter(e["type"] for e in g.data["edges"])
     for t, c in by_type.most_common():
@@ -2010,8 +2303,9 @@ def cmd_report(root):
             continue
         if nid in has_caller or is_test_file(n.get("file", "")):
             continue
-        if n.get("annotations") or n["name"] == "main" or n.get("synthetic"):
-            continue  # entry points / framework-invoked / Lombok-generated
+        if n.get("annotations") or n["name"] == "main" or n.get("synthetic") \
+                or n.get("abstract"):
+            continue  # entry points / framework-invoked / generated / contracts
         if any(e["type"] == "OVERRIDES" for e in g.out_edges[nid]):
             continue  # implements an interface — called via dispatch
         orphans.append(nid)
@@ -2202,7 +2496,10 @@ def _viz_payload(g):
     callers_of_type = Counter()
     agg = {}
     for e in g.data["edges"]:
-        if e["type"] in ("HAS_METHOD", "HAS_FIELD"):
+        # DISPATCHES_TO duplicates IMPLEMENTS at type level; externals
+        # are out-of-repo — keep the canvas to in-repo structure
+        if e["type"] in ("HAS_METHOD", "HAS_FIELD", "DISPATCHES_TO",
+                         "USES_EXTERNAL"):
             continue
         a, b = to_type(e["src"]), to_type(e["dst"])
         if a == b or a not in g.nodes or b not in g.nodes:
@@ -2514,7 +2811,8 @@ DATA.clusters.forEach(c=>{
 });
 
 // --- render --------------------------------------------------------------
-const EDGE_COLOR={CALLS:'#3d444d',EXTENDS:'#bb8009',IMPLEMENTS:'#8957e5'};
+const EDGE_COLOR={CALLS:'#3d444d',EXTENDS:'#bb8009',IMPLEMENTS:'#8957e5',
+                  PUBLISHES_TO:'#56d4dd'};
 function neighborsOf(id){
   const s=new Set([id]);
   (adj[id]||[]).forEach(e=>{s.add(e.src);s.add(e.dst);});
@@ -2528,8 +2826,9 @@ function frame(){
   const focus = selected?neighborsOf(selected.id):null;
   // edges
   edges.forEach(e=>{
-    if(e.type==='CALLS'&&!showCalls)return;
-    if(e.type!=='CALLS'&&!showInh)return;
+    const callish=(e.type==='CALLS'||e.type==='PUBLISHES_TO');
+    if(callish&&!showCalls)return;
+    if(!callish&&!showInh)return;
     const a=byId[e.src], b=byId[e.dst];
     if(hiddenClusters.has(a.cluster)||hiddenClusters.has(b.cluster))return;
     const [x1,y1]=toScreen(a.x,a.y), [x2,y2]=toScreen(b.x,b.y);
