@@ -1,4 +1,4 @@
-# jkg Graph Schema (v3)
+# jkg Graph Schema (v4)
 
 Everything lives in `<repo>/.jkg/` as plain JSON — no database, no native
 deps, trivially diffable and portable.
@@ -13,7 +13,7 @@ deps, trivially diffable and portable.
 
 ```jsonc
 {
-  "schema": 3,
+  "schema": 4,
   "indexedAt": "2026-06-11T10:04:15",
   "root": "/abs/path/to/repo",
   "stats": { "files": 42, "types": 47, "methods": 173, "nodes": 286,
@@ -32,7 +32,7 @@ deps, trivially diffable and portable.
 | `id` | Types: FQN (`com.shop.service.OrderService`). Methods: `FQN#name/arity` (`…OrderService#placeOrder/1`). Constructors use `<init>`. Fields: `FQN.fieldName`. External library types: `ext:<FQN>`. |
 | `kind` | `Class` · `Interface` · `Enum` · `Record` · `Method` · `Constructor` · `Field` · `External` |
 | `name` | Simple name |
-| `file`, `line` | Location (file is repo-relative; empty for `External`) |
+| `file`, `line`, `endLine` | Location (file is repo-relative; empty for `External`). Methods carry `endLine` so tools can read exactly the `line`–`endLine` range instead of the whole file. |
 | `owner` | Methods/fields only: FQN of the declaring type |
 | `pkg` | Types only: package |
 | `annotations` | e.g. `["RestController"]` — drives entry-point detection |

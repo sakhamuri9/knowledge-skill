@@ -35,7 +35,8 @@ import argparse
 import time
 from collections import defaultdict, Counter
 
-SCHEMA_VERSION = 3  # v3: dispatch edges, Spring Data synthesis, externals,
+SCHEMA_VERSION = 4  # v4: method end lines (precise read ranges);
+                    # v3: dispatch edges, Spring Data synthesis, externals,
                     #     abstract-type flags, package-proximity resolution
 JKG_DIR = ".jkg"
 GRAPH_FILE = "graph.json"
@@ -482,19 +483,22 @@ def parse_java(src, rel_path):
             annos = annotations_before(text, body_lo, m.start(2))
             body_span = None
             calls, locs = [], {}
+            end_line = line_of(text, name_pos)
             if after_ws.startswith('{') and body_open_pos != -1:
                 bclose = match_brace(text, body_open_pos)
                 body_span = (body_open_pos, bclose)
                 body = text[body_open_pos:bclose + 1]
                 calls = extract_calls(body, text, body_open_pos, orig)
                 locs = extract_locals(body)
+                end_line = line_of(text, bclose)
             if any(s[0] <= name_pos < s[1] for s in seen_spans):
                 continue
             if body_span:
                 seen_spans.append(body_span)
             rec = {
                 "name": name, "arity": len(params), "params": params,
-                "line": line_of(text, name_pos), "annotations": annos,
+                "line": line_of(text, name_pos), "endLine": end_line,
+                "annotations": annos,
                 "static": "static" in mods, "abstract": after_ws.startswith(';'),
                 "public": "public" in mods or t["kind"] == "interface",
                 "ctor": False, "calls": calls, "locals": locs,
@@ -542,6 +546,7 @@ def parse_java(src, rel_path):
             methods.append({
                 "name": "<init>", "arity": len(params), "params": params,
                 "line": line_of(text, name_pos),
+                "endLine": line_of(text, bclose),
                 "annotations": annotations_before(text, body_lo, name_pos),
                 "static": False, "abstract": False, "public": "public" in mods,
                 "ctor": True,
@@ -736,6 +741,7 @@ class GraphBuilder:
             "id": mid, "kind": "Constructor" if m["ctor"] else "Method",
             "name": m["name"] if not m["ctor"] else td["name"],
             "display": disp, "qname": mid, "file": file, "line": m["line"],
+            "endLine": m.get("endLine", m["line"]),
             "owner": td["qname"], "arity": m["arity"],
             "annotations": m["annotations"], "public": m["public"],
             "static": m["static"], "abstract": m["abstract"],
@@ -1415,58 +1421,8 @@ def cmd_analyze(root, quiet=False):
         if n_pub:
             print("  ◆ %d async messaging edge(s) (Kafka/JMS/Rabbit) — "
                   "producer→listener flows stitched by topic" % n_pub)
-        print("  " + token_economics(repo_bytes))
     return graph
 
-
-QUERY_TOKENS = 500  # typical tokens for one graph-query answer
-PRICE_PER_MTOK = 3.0  # USD per 1M input tokens (Sonnet-class)
-
-
-def record_saving(root, command, repo_bytes):
-    """Token odometer: every graph query avoids one repo scan."""
-    if not repo_bytes:
-        return
-    path = os.path.join(jkg_path(root), "savings.json")
-    data = load_json(path) or {"questions": 0, "tokensSaved": 0, "events": []}
-    saved = max(0, repo_bytes // 4 - QUERY_TOKENS)
-    data["questions"] += 1
-    data["tokensSaved"] += saved
-    data["events"] = (data["events"] + [{"cmd": command, "saved": saved,
-                                         "at": time.strftime("%Y-%m-%dT%H:%M:%S")}])[-200:]
-    save_json(path, data)
-
-
-def load_savings(root):
-    return load_json(os.path.join(jkg_path(root), "savings.json")) or \
-        {"questions": 0, "tokensSaved": 0, "events": []}
-
-
-def fmt_tokens(t):
-    return "%.1fM" % (t / 1e6) if t >= 1e6 else "%.0fk" % (t / 1e3) \
-        if t >= 1000 else str(int(t))
-
-
-def odometer_line(root):
-    s = load_savings(root)
-    if not s["questions"]:
-        return None
-    usd = s["tokensSaved"] / 1e6 * PRICE_PER_MTOK
-    return ("odometer: %d questions answered from the graph · ~%s tokens "
-            "saved (≈ $%.2f at $%.0f/M)" % (s["questions"],
-                                            fmt_tokens(s["tokensSaved"]),
-                                            usd, PRICE_PER_MTOK))
-
-
-def token_economics(repo_bytes):
-    repo_tokens = max(1, repo_bytes // 4)  # ~4 chars/token
-    ratio = repo_tokens // QUERY_TOKENS
-    def fmt(t):
-        return "%.1fM" % (t / 1e6) if t >= 1e6 else "%.0fk" % (t / 1e3) \
-            if t >= 1000 else str(t)
-    return ("token economics: reading the repo ≈ %s tokens; one graph query "
-            "≈ %s tokens (~%dx cheaper)"
-            % (fmt(repo_tokens), fmt(QUERY_TOKENS), max(1, ratio)))
 
 
 class Graph:
@@ -1505,7 +1461,11 @@ class Graph:
 
     def loc(self, nid):
         n = self.nodes.get(nid, {})
-        return "%s:%s" % (n.get("file", "?"), n.get("line", "?"))
+        base = "%s:%s" % (n.get("file", "?"), n.get("line", "?"))
+        end = n.get("endLine")
+        if end and end != n.get("line"):
+            base += "-%d" % end  # read just this range, not the whole file
+        return base
 
     # symbol lookup: accepts Name, Class.method, fqn, fqn#m/2
     def find_symbol(self, ref):
@@ -1564,7 +1524,6 @@ def resolve_one(g, ref):
 
 def cmd_query(root, text, top=12, as_json=False):
     g = Graph(root)
-    record_saving(root, "query", g.data["stats"].get("repoBytes", 0))
     qtoks = [t for t in re.split(r'[^a-zA-Z0-9]+', text.lower()) if t]
     scored = []
     for nid, n in g.nodes.items():
@@ -1624,7 +1583,12 @@ def cmd_query(root, text, top=12, as_json=False):
 
 def cmd_context(root, ref):
     g = Graph(root)
-    record_saving(root, "context", g.data["stats"].get("repoBytes", 0))
+    if not g.find_symbol(ref):
+        # don't burn a round-trip on "not found" — answer with the closest
+        # matches so the caller can pick from this same output
+        print("Symbol %r not found — closest graph matches instead:\n" % ref)
+        cmd_query(root, " ".join(re.split(r'[^a-zA-Z0-9]+', ref)), top=8)
+        return
     nid = resolve_one(g, ref)
     n = g.nodes[nid]
     print("═" * 70)
@@ -1756,7 +1720,6 @@ def risk_level(direct, total, procs, areas):
 
 def cmd_impact(root, ref, direction="upstream", max_depth=3, as_json=False):
     g = Graph(root)
-    record_saving(root, "impact", g.data["stats"].get("repoBytes", 0))
     nid = resolve_one(g, ref)
     n = g.nodes[nid]
     seeds = {nid}
@@ -1836,7 +1799,6 @@ def cmd_impact(root, ref, direction="upstream", max_depth=3, as_json=False):
 
 def cmd_edge_list(root, ref, direction):
     g = Graph(root)
-    record_saving(root, "callers", g.data["stats"].get("repoBytes", 0))
     nid = resolve_one(g, ref)
     edges = g.in_edges[nid] if direction == "in" else g.out_edges[nid]
     rels = [e for e in edges if e["type"] in ("CALLS", "INSTANTIATES")]
@@ -1861,7 +1823,6 @@ def cmd_flows(root, filt=None):
 
 def cmd_flow(root, pid):
     g = Graph(root)
-    record_saving(root, "flow", g.data["stats"].get("repoBytes", 0))
     proc = next((p for p in g.processes
                  if p["id"].lower() == pid.lower()
                  or pid.lower() in p["label"].lower()), None)
@@ -2088,11 +2049,51 @@ def cmd_stats(root):
         c = len([e for e in g.in_edges[n["id"]] if e["type"] == "CALLS"])
         if c:
             print("    %-44s %d callers" % (g.display(n["id"]), c))
-    if s.get("repoBytes"):
-        print("  " + token_economics(s["repoBytes"]))
-    odo = odometer_line(root)
-    if odo:
-        print("  " + odo)
+
+
+def cmd_overview(root):
+    """One-call digest: architecture + flows + hotspots. Designed so an
+    agent can explain a codebase from a single tool round-trip instead of
+    chaining stats/clusters/flows/context (each round-trip re-sends the
+    whole conversation — turns cost more than output lines)."""
+    g = Graph(root)
+    s = g.data["stats"]
+    print("%s — %d files · %d types · %d methods · %d flows · %d areas"
+          % (os.path.basename(g.data["root"]), s["files"], s["types"],
+             s["methods"], s["processes"], s["clusters"]))
+
+    print("\nFunctional areas:")
+    for c in g.clusters[:8]:
+        names = ", ".join(g.nodes[m]["name"] for m in c["members"][:4])
+        more = "…" if len(c["members"]) > 4 else ""
+        print("  %-4s %-24s %3d types  %s%s"
+              % (c["id"], c["label"], len(c["members"]), names, more))
+    if len(g.clusters) > 8:
+        print("  … and %d more (jkg.py clusters)" % (len(g.clusters) - 8))
+
+    if g.processes:
+        print("\nExecution flows (entry → terminal):")
+        for p in g.processes[:10]:
+            print("  %-4s %-56s %d steps  %s"
+                  % (p["id"], p["label"][:56], p["stepCount"], p["reason"]))
+        if len(g.processes) > 10:
+            print("  … and %d more (jkg.py flows)" % (len(g.processes) - 10))
+        main_flow = g.processes[0]
+        print("\nMain flow %s, step by step:" % main_flow["id"])
+        for i, st in enumerate(main_flow["steps"]):
+            print("  %2d. %-44s %s" % (i + 1, g.display(st), g.loc(st)))
+
+    fan_in = Counter()
+    for e in g.data["edges"]:
+        if e["type"] == "CALLS":
+            fan_in[e["dst"]] += 1
+    hot = [(nid, c) for nid, c in fan_in.most_common(5) if c >= 2]
+    if hot:
+        print("\nMost-called symbols (change with care):")
+        for nid, c in hot:
+            print("  %-44s %d callers" % (g.display(nid), c))
+    print("\nnext: flow <id> · ask \"<question>\" · impact <symbol> "
+          "(before edits) — each is one call")
 
 
 # ---------------------------------------------------------------------------
@@ -2137,7 +2138,6 @@ def _extract_symbols(g, question):
 
 def cmd_ask(root, question):
     g = Graph(root)
-    record_saving(root, "ask", g.data["stats"].get("repoBytes", 0))
     q = question.lower()
     syms = _extract_symbols(g, question)
     print("Q: %s\n" % question)
@@ -2170,15 +2170,22 @@ def cmd_ask(root, question):
         toks = [t for t in re.split(r'[^a-zA-Z0-9]+', q) if len(t) > 3 and
                 t not in ("does", "what", "happens", "when", "work", "works",
                           "flow", "explain", "trace", "walk")]
-        best, score = None, 0
+        ranked = []
         for p in g.processes:
-            s = sum(1 for t in toks if t in p["label"].lower())
+            entry_disp = g.display(p["entry"]).lower()
+            # entry-point matches dominate: "matching flow" should pick a
+            # MatchingController entry over a flow that merely steps through
+            # matching-named helpers
+            s = 3.0 * sum(1 for t in toks if t in entry_disp)
+            s += 1.5 * sum(1 for t in toks if t in p["label"].lower())
             for sid in p["steps"]:
-                s += sum(0.5 for t in toks
+                s += sum(0.3 for t in toks
                          if t in g.nodes[sid]["name"].lower())
-            if s > score:
-                best, score = p, s
-        if best:
+            if s > 0:
+                ranked.append((s, p["id"], p))
+        ranked.sort(key=lambda x: (-x[0], x[1]))
+        if ranked:
+            best = ranked[0][2]
             print("Answer — this is implemented by execution flow %s:\n"
                   % best["id"])
             for i, s in enumerate(best["steps"]):
@@ -2191,6 +2198,30 @@ def cmd_ask(root, question):
                      if (g.nodes[s].get("owner") or s) in g.member_cluster}
             if areas:
                 print("\n  Functional areas involved: " + ", ".join(sorted(areas)))
+            if len(ranked) > 1:
+                print("\n  If that's not the flow you meant "
+                      "(jkg.py flow <id>):")
+                for s_, _, p in ranked[1:4]:
+                    print("    %-4s %-56s %d steps  %s"
+                          % (p["id"], p["label"][:56], p["stepCount"],
+                             p["reason"]))
+            # related types: when the right flow doesn't exist, the right
+            # symbol usually does — surface it in this same answer
+            rel = []
+            for nid2, n2 in g.nodes.items():
+                if n2["kind"] not in ("Class", "Interface"):
+                    continue
+                hit = sum(1 for t in toks
+                          if t in set(camel_tokens(n2["name"])))
+                if hit:
+                    n_meth = len([e for e in g.out_edges[nid2]
+                                  if e["type"] == "HAS_METHOD"])
+                    rel.append((-hit, -n_meth, n2["name"], nid2))
+            if rel:
+                rel.sort()
+                print("\n  Related types (jkg.py context <name>): " +
+                      ", ".join("%s (%s)" % (name, g.loc(nid2))
+                                for _, _, name, nid2 in rel[:4]))
             print("\n  To go deeper, read only: " +
                   ", ".join(files_to_read(best["steps"])))
             return
@@ -2255,7 +2286,6 @@ def _pkg_sccs(g):
 
 def cmd_report(root):
     g = Graph(root)
-    record_saving(root, "report", g.data["stats"].get("repoBytes", 0))
     s = g.data["stats"]
     lines = []
     w = lines.append
@@ -2356,11 +2386,6 @@ def cmd_report(root):
     for p in g.processes[:5]:
         w("- **%s** — %d steps (`jkg.py flow %s`)" % (p["label"],
                                                       p["stepCount"], p["id"]))
-    odo = odometer_line(root)
-    if odo:
-        w("")
-        w("---")
-        w("_%s_" % odo)
     report = "\n".join(lines) + "\n"
     out = os.path.join(jkg_path(root), "report.md")
     with open(out, 'w', encoding='utf-8') as f:
@@ -2377,6 +2402,10 @@ MCP_TOOLS = [
     {"name": "ask", "description": "Ask a natural-language question about the "
      "Java codebase, answered from the knowledge graph (no file scanning).",
      "args": {"question": "the question"}},
+    {"name": "overview", "description": "One-call architecture digest: "
+     "functional areas, execution flows with the main flow traced step by "
+     "step, and hotspots. Call this FIRST to explain a codebase.",
+     "args": {}},
     {"name": "query", "description": "Search the code knowledge graph for "
      "symbols and execution flows matching a concept.",
      "args": {"text": "search terms"}},
@@ -2419,6 +2448,8 @@ def _mcp_call(root, name, args):
         with contextlib.redirect_stdout(buf):
             if name == "jkg_ask":
                 cmd_ask(root, args.get("question", ""))
+            elif name == "jkg_overview":
+                cmd_overview(root)
             elif name == "jkg_query":
                 cmd_query(root, args.get("text", ""))
             elif name == "jkg_context":
@@ -2561,13 +2592,7 @@ def _viz_payload(g):
                        "steps": [g.display(s) + "  (" + g.loc(s) + ")"
                                  for s in p["steps"]]})
     s = g.data["stats"]
-    repo_tokens = max(1, s.get("repoBytes", 0) // 4)
-    sav = load_savings(g.data["root"])
     return {"project": os.path.basename(g.data["root"]), "stats": s,
-            "tokens": {"repo": repo_tokens, "query": QUERY_TOKENS,
-                       "ratio": max(1, repo_tokens // QUERY_TOKENS),
-                       "saved": sav["tokensSaved"],
-                       "questions": sav["questions"]},
             "nodes": vnodes, "edges": vedges,
             "clusters": [{"id": c["id"], "label": c["label"],
                           "n": len(c["members"])} for c in g.clusters],
@@ -2589,8 +2614,6 @@ VIZ_HTML = r"""<!DOCTYPE html>
   #hdr h1 { font-size:15px; font-weight:600; white-space:nowrap; }
   #hdr h1 span { color:var(--accent); }
   #stats { color:var(--dim); white-space:nowrap; }
-  #badge { background:#1f6feb22; border:1px solid #1f6feb; color:#79c0ff;
-           border-radius:14px; padding:3px 12px; white-space:nowrap; }
   #search { background:var(--bg); color:var(--fg); border:1px solid var(--line);
             border-radius:6px; padding:5px 10px; width:200px; }
   select { background:var(--bg); color:var(--fg); border:1px solid var(--line);
@@ -2622,7 +2645,6 @@ VIZ_HTML = r"""<!DOCTYPE html>
 <div id="hdr">
   <h1>⬡ <span>jkg</span> · __PROJECT__</h1>
   <span id="stats"></span>
-  <span id="badge"></span>
   <input id="search" placeholder="search types… (Enter to focus)">
   <select id="flowSel"><option value="">— highlight a flow —</option></select>
   <label class="tgl"><input type="checkbox" id="tCalls" checked> calls</label>
@@ -2768,13 +2790,6 @@ const S=DATA.stats;
 document.getElementById('stats').textContent =
   S.types+' types · '+S.methods+' methods · '+S.edges+' edges · '
   +S.processes+' flows';
-const T=DATA.tokens;
-const fmt=t=>t>=1e6?(t/1e6).toFixed(1)+'M':t>=1e3?Math.round(t/1e3)+'k':t;
-document.getElementById('badge').textContent =
-  '⚡ one query ≈ '+fmt(T.query)+' tokens vs '+fmt(T.repo)
-  +' to read the repo — '+T.ratio+'× cheaper'
-  +(T.questions?' · saved so far: '+fmt(T.saved)+' tokens ('
-    +T.questions+' questions)':'');
 const flowSel=document.getElementById('flowSel');
 DATA.flows.forEach(f=>{
   const o=document.createElement('option'); o.value=f.id;
@@ -2895,15 +2910,17 @@ RULES_BLOCK = """<!-- jkg:start -->
 # Java Knowledge Graph (jkg)
 
 This project is indexed by **jkg** — a file-based code knowledge graph in
-`.jkg/` (plain JSON, no database). Query the graph instead of scanning files.
+`.jkg/` (plain JSON, no database).
 
 ## Always Do
+- **One question → one command.** `overview` to explain the codebase,
+  `ask "<question>"` for anything specific. Don't chain query/context/flows —
+  each tool call re-sends the conversation and costs more than it saves.
 - **MUST run `python3 {script} impact <symbol>` before editing any class or
   method** and report the blast radius (direct callers, flows, risk) to the user.
 - **MUST run `python3 {script} diff` before committing** to verify only
   expected symbols and execution flows are affected.
 - **MUST warn the user** on HIGH or CRITICAL risk before proceeding.
-- Use `query`/`context`/`flows` to navigate instead of grepping the repo.
 
 ## Never Do
 - NEVER edit a method without running `impact` on it first.
@@ -2969,6 +2986,7 @@ def main():
     h.add_argument("symbol")
     sub.add_parser("cycles", help="package dependency cycles")
     sub.add_parser("diff", help="what changed since last analyze")
+    sub.add_parser("overview", help="one-call digest: areas, flows, hotspots")
     sub.add_parser("stats", help="graph statistics")
     sub.add_parser("init", help="analyze + install CLAUDE.md rules")
     v = sub.add_parser("viz", help="generate interactive graph UI (.jkg/graph.html)")
@@ -3007,6 +3025,8 @@ def main():
         cmd_cycles(root)
     elif args.cmd == "diff":
         cmd_diff(root)
+    elif args.cmd == "overview":
+        cmd_overview(root)
     elif args.cmd == "stats":
         cmd_stats(root)
     elif args.cmd == "init":

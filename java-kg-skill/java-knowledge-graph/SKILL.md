@@ -13,160 +13,76 @@ description: >
 
 # Java Knowledge Graph (jkg)
 
-Answer questions about a Java codebase from a **pre-built knowledge graph**
-instead of reading every file. One `analyze` pass builds the graph
-(classes, interfaces, methods, calls, inheritance, execution flows,
-functional areas) into `.jkg/graph.json` — after that, every question is a
-single fast query, not a repo-wide scan.
-
-All commands:
+Answer questions about a Java codebase from a pre-built knowledge graph.
 
 ```bash
 python3 {SKILL_DIR}/scripts/jkg.py --root <repo> <command>
 ```
 
-`--root` defaults to the current directory. Pure Python 3 stdlib — nothing to install.
+`--root` defaults to cwd. Pure Python 3 stdlib. If `.jkg/graph.json` is
+missing or files changed since, run `analyze` first (incremental, fast).
 
-## The Golden Rules
+## Cost discipline (read this first)
 
-1. **Graph first, files second.** Resolve "where is X / what calls X / how
-   does X work" with `query`, `context`, and `flows` — then Read only the
-   2–3 files the graph points at. Never grep the whole repo for call sites.
-2. **MUST run `impact <symbol>` before editing any class or method**, and
-   report the blast radius (risk level, direct callers, affected flows) to
-   the user. Warn explicitly on HIGH or CRITICAL risk before proceeding.
-3. **MUST run `diff` before committing** — it shows exactly which symbols,
-   callers, and execution flows your edits touched.
-4. **Keep the graph fresh.** After editing files, re-run `analyze` — it's
-   incremental (only changed files are re-parsed, sub-second).
+Every command is a tool round-trip, and each round-trip re-sends the whole
+conversation — **chained commands cost more than the graph saves**. Rules:
 
-## Setup (first use in a repo)
+1. **One question → one command.** Pick the single command that answers it;
+   never run query → context → flows → flow as a pipeline.
+2. **"Explain this codebase / the flow"** → `overview` (one call: areas,
+   flows, main flow traced step-by-step, hotspots). Answer from it directly.
+3. **A specific question** → `ask "<question>"` (one call — routes to
+   impact/flow/context internally and prints the answer).
+4. **Small repo (≲30 files) and no edit planned?** Skip the graph; read the
+   files. The graph pays off on large repos and for impact/diff safety.
+5. **Read line ranges, not files.** Graph output prints methods as
+   `File.java:178-245` — Read with that offset/limit. Enterprise files are
+   often 2000+ lines; never read one whole to see one method.
+6. `report` and `viz` only when the user explicitly asks for a health
+   report or visualization — `overview` already covers architecture
+   questions.
 
-```bash
-python3 {SKILL_DIR}/scripts/jkg.py analyze        # build the graph
-python3 {SKILL_DIR}/scripts/jkg.py stats          # confirm what was indexed
-```
-
-If `.jkg/graph.json` already exists, skip straight to querying.
-Optional: `init` instead of `analyze` also installs these rules into the
-target repo's CLAUDE.md so future sessions follow them automatically.
-
-## Command Reference
+## Commands
 
 | Command | Use for |
 |---------|---------|
-| `analyze` | Build / incrementally refresh the graph |
-| `ask "<question>"` | Natural-language question routed to the right graph operation ("what breaks if I change X?", "how does login work?") — good default when unsure which command fits |
-| `query "<concept>"` | Find symbols + related execution flows by concept ("cancel order", "email") |
-| `context <symbol>` | 360° view: definition, members, callers, callees, overrides, flows, area |
-| `impact <symbol> [--direction upstream\|downstream] [--json]` | Blast radius + risk level — **run before every edit** |
-| `callers <symbol>` / `callees <symbol>` | Direct call edges with confidence + resolution reason |
-| `flows [filter]` | List execution flows (entry point → terminal) |
-| `flow <id>` | Step-by-step trace of one flow with file:line |
-| `clusters` | Functional areas (auto-detected via call-graph clustering) |
-| `hierarchy <Type>` | Supertype / subtype tree |
-| `cycles` | Package dependency cycles (architecture smell check) |
-| `diff` | What changed since last analyze — **run before committing** |
-| `stats` | Graph size, edge breakdown, most-called symbols, token economics |
-| `viz [--open]` | Generate `.jkg/graph.html` — interactive force-directed graph UI (cluster colors, flow highlighting, search, details panel). Self-contained, works offline. |
-| `report` | Architecture health one-pager: god-class hotspots, dead-code candidates, package cycles, area cohesion → `.jkg/report.md` |
-| `mcp` | Serve the graph as MCP tools over stdio (for Cursor, Claude Desktop, any MCP client) |
+| `analyze` | Build/refresh the graph (incremental; multi-core on big repos) |
+| `overview` | **Default first call** — areas, flows, main flow steps, hotspots |
+| `ask "<question>"` | NL question → routed answer ("what breaks if…", "how does X work?") |
+| `impact <symbol> [--json]` | Blast radius + risk — **required before editing a symbol** |
+| `diff` | Changed symbols/flows since last analyze — **run before committing** |
+| `flow <id\|name>` / `flows [filter]` | Step-by-step trace / list of execution flows |
+| `query "<concept>"` · `context <symbol>` · `callers/callees <symbol>` | Targeted lookups |
+| `hierarchy <Type>` · `clusters` · `cycles` · `stats` · `report` | Structure & health |
+| `viz [--open]` | Self-contained interactive graph UI (`.jkg/graph.html`) |
+| `mcp` | Serve the graph as MCP tools over stdio |
 
-Every query is logged to a **token odometer** (`.jkg/savings.json`) — `stats`
-and the viz badge show cumulative tokens/dollars saved versus re-reading the
-repo. Quote these numbers when reporting to the user.
+`<symbol>` = simple name, `Class.method`, or FQN. Ambiguity prints candidates.
 
-`<symbol>` accepts a simple name (`OrderService`), `Class.method`
-(`OrderService.placeOrder`), or a fully qualified name. Ambiguous names
-print candidates to choose from.
+## Editing workflow
 
-## Workflows
+1. `impact X` → report risk + direct callers; **warn the user and pause on
+   HIGH/CRITICAL** before editing.
+2. Edit, then `analyze` (incremental refresh).
+3. Before commit: `diff` → confirm only expected symbols/flows changed.
 
-### "How does X work?" (exploration)
+## Reading the output
 
-1. `query "x concept"` → top symbols grouped by functional area + related flows
-2. `flow P3` → the exact execution path, step by step with file:line
-3. `context <symbol>` on the interesting step
-4. Read **only** the files the graph pointed at
+- **Risk:** LOW <5 direct callers · MEDIUM ≥5 · HIGH ≥15 (or ≥3 flows/areas)
+  · CRITICAL ≥30 (or ≥5 flows/areas). d=1 = will break, d=2 likely, d=3 test.
+- **Confidence:** 1.0 inheritance/instantiation · 0.8–0.9 type-resolved ·
+  0.75 single-impl dispatch · 0.5–0.7 multi-impl dispatch / async topic ·
+  ≤0.5 name-fallback (verify before relying on it).
+- **`◬` epistemic note:** target behind an interface — results are a lower
+  bound; say so when reporting.
 
-### "Change X safely" (edit)
+## What the graph covers (big-repo accuracy)
 
-1. `impact X` → report risk + direct callers to the user
-   - HIGH/CRITICAL → **stop and warn** before editing; review every d=1 caller
-2. Make the edit
-3. `analyze` (incremental refresh) → `diff` is implicit in your next step
-4. Before commit: `diff` → verify only expected symbols/flows are affected
-
-### "Show me the architecture" (visualization)
-
-When the user wants to *see* the codebase, run `viz --open` — it opens an
-interactive graph in their browser: types colored by functional area,
-node size by caller count, dashed rings for interfaces, a flow dropdown
-that highlights execution paths, and a search box. Mention they can click
-any node for its callers/callees.
-
-### "Why is X failing?" (debugging)
-
-1. `query "<feature>"` → find the flow that implements the broken behavior
-2. `flow <id>` → walk the steps; the bug is on this path
-3. `impact <suspect> --direction downstream` → what the suspect depends on
-
-## Understanding Output
-
-**Risk levels** (impact):
-
-| Risk | Threshold | Meaning |
-|------|-----------|---------|
-| LOW | <5 direct callers | Safe with normal care |
-| MEDIUM | ≥5 direct or ≥30 total | Check d=1 callers |
-| HIGH | ≥15 direct, or ≥3 flows/areas, or ≥100 total | Warn user; review every direct caller |
-| CRITICAL | ≥30 direct, or ≥5 flows/areas, or ≥200 total | Warn user; suggest staged change + tests |
-
-**Impact depths:** d=1 WILL BREAK (direct callers) · d=2 LIKELY AFFECTED ·
-d=3 MAY NEED TESTING.
-
-**Edge confidence:** 1.0 exact (inheritance, instantiation) · 0.8–0.9
-type-resolved calls · 0.75 single-implementation dispatch · 0.5–0.6
-multi-implementation dynamic dispatch · 0.7 async topic match ·
-0.35–0.5 name-based fallback (verify by reading the call site before
-relying on it).
-
-**Epistemic notes (`◬`):** when a target sits behind an interface or is
-overridden, callers may bind via dependency injection at runtime — treat
-the result as a **lower bound** and say so when reporting.
-
-**Flows:** entry points are `main` methods, Spring/Jakarta endpoints
-(`@GetMapping`, `@RequestMapping`, …), schedulers, and message listeners
-(`@KafkaListener`, `@JmsListener`, `@RabbitListener`, `@SqsListener`).
-A flow is the longest call chain from an entry point to a terminal — the
-fastest way to understand a feature end-to-end.
-
-## Big-repo accuracy (what makes flows survive real codebases)
-
-- **Interface / abstract-class boundaries:** `DISPATCHES_TO` edges connect
-  every interface/abstract method to its implementations (transitively
-  through abstract bases), so a layered chain like
-  `Controller → ServiceInterface → ServiceImpl → AbstractProcessor →
-  ConcreteProcessor` traces end-to-end instead of dead-ending. `context`
-  shows these as "Dispatches to".
-- **Generated code:** Lombok (`@Data`/`@Getter`/`@Builder`/constructors) and
-  Spring Data repository CRUD methods (`save`, `findById`, … on interfaces
-  extending `JpaRepository`/`CrudRepository`/…) are synthesized into the
-  graph, so calls to them resolve instead of silently disappearing.
-- **Async messaging (Kafka / JMS / Rabbit / SQS):** producer calls
-  (`kafkaTemplate.send("topic", …)`, `jmsTemplate.convertAndSend`) are
-  matched to listener methods by topic key — `PUBLISHES_TO` edges let flows
-  and impact analysis cross the messaging boundary. `context` shows
-  "Publishes to" / "Consumes from".
-- **External dependency classes:** calls into imported library types are
-  recorded as `USES_EXTERNAL` edges (`context` lists them under "External
-  dependencies") so you can see exactly where execution leaves the repo.
-- **Duplicate names across modules:** ambiguous simple names resolve by
-  package proximity (longest shared package prefix wins); genuinely
-  ambiguous references are dropped, never guessed.
-- **Scale:** flow count and trace depth scale with repo size (up to 400
-  flows, depth 14); parsing fans out across CPU cores when ≥64 files
-  changed. Re-`analyze` is always incremental.
-
-See `reference/SCHEMA.md` for the full node/edge schema and `.jkg/graph.json`
-layout (only needed when querying the JSON directly with `--json`).
+Flows survive the boundaries that break naive call tracing: interface →
+implementation dispatch (`DISPATCHES_TO`, transitive through abstract
+classes), Lombok and Spring Data generated methods (synthesized so
+`order.getId()` / `repo.save()` resolve), Kafka/JMS/Rabbit/SQS async hops
+(`PUBLISHES_TO`, matched by topic), external library calls (`USES_EXTERNAL`
+marks where execution leaves the repo), and duplicate class names across
+modules (package-proximity resolution). See `reference/SCHEMA.md` for the
+full schema — read it only if querying `graph.json` directly.
