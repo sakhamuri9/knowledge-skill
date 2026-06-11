@@ -2522,22 +2522,23 @@ def _viz_payload(g):
     def to_type(nid):
         return owner.get(nid) or nid
 
-    type_ids = [nid for nid, n in g.nodes.items()
-                if n["kind"] in ("Class", "Interface", "Enum", "Record")]
+    TYPE_KINDS = ("Class", "Interface", "Enum", "Record")
+    type_ids = [nid for nid, n in g.nodes.items() if n["kind"] in TYPE_KINDS]
     callers_of_type = Counter()
     agg = {}
     for e in g.data["edges"]:
-        # DISPATCHES_TO duplicates IMPLEMENTS at type level; externals
-        # are out-of-repo — keep the canvas to in-repo structure
-        if e["type"] in ("HAS_METHOD", "HAS_FIELD", "DISPATCHES_TO",
-                         "USES_EXTERNAL"):
+        # DISPATCHES_TO duplicates IMPLEMENTS at type level — skip it
+        if e["type"] in ("HAS_METHOD", "HAS_FIELD", "DISPATCHES_TO"):
             continue
-        a, b = to_type(e["src"]), to_type(e["dst"])
-        if a == b or a not in g.nodes or b not in g.nodes:
+        a = to_type(e["src"])
+        if a not in g.nodes or g.nodes[a]["kind"] not in TYPE_KINDS:
             continue
-        if g.nodes[a]["kind"] not in ("Class", "Interface", "Enum", "Record"):
+        if e["type"] == "USES_EXTERNAL":
+            key = (a, e["dst"], "EXTERNAL")  # library boundary, kept visible
+            agg[key] = agg.get(key, 0) + 1
             continue
-        if g.nodes[b]["kind"] not in ("Class", "Interface", "Enum", "Record"):
+        b = to_type(e["dst"])
+        if a == b or b not in g.nodes or g.nodes[b]["kind"] not in TYPE_KINDS:
             continue
         et = "CALLS" if e["type"] in ("CALLS", "INSTANTIATES", "OVERRIDES") \
             else e["type"]
@@ -2546,36 +2547,54 @@ def _viz_payload(g):
         if et == "CALLS":
             callers_of_type[b] += 1
 
-    def top_links(nid, incoming):
-        out, seen = [], set()
+    def agg_links(nid, incoming):
+        """All call partners of a type, aggregated with counts."""
+        cnt = Counter()
         members = {nid} | {e["dst"] for e in g.out_edges[nid]
                            if e["type"] in ("HAS_METHOD", "HAS_FIELD")}
         for m in members:
             edges = g.in_edges[m] if incoming else g.out_edges[m]
             for e in edges:
-                if e["type"] not in ("CALLS", "INSTANTIATES"):
-                    continue
-                o = e["src"] if incoming else e["dst"]
-                lab = "%s → %s" % (g.display(e["src"]), g.display(e["dst"]))
-                if lab not in seen and to_type(o) != nid:
-                    seen.add(lab)
-                    out.append(lab)
-        return out[:8]
+                if e["type"] in ("CALLS", "INSTANTIATES"):
+                    o = to_type(e["src"] if incoming else e["dst"])
+                    if o != nid and o in g.nodes:
+                        cnt[g.nodes[o]["name"]] += 1
+                elif e["type"] == "USES_EXTERNAL" and not incoming:
+                    cnt[g.nodes[e["dst"]]["name"] + " (lib)"] += 1
+        return [{"name": k, "n": v} for k, v in cnt.most_common(40)]
 
     vnodes = []
     for nid in sorted(type_ids):
         n = g.nodes[nid]
         cl = g.member_cluster.get(nid)
-        methods = [g.nodes[e["dst"]] for e in g.out_edges[nid]
-                   if e["type"] == "HAS_METHOD"]
+        methods = sorted((g.nodes[e["dst"]] for e in g.out_edges[nid]
+                          if e["type"] == "HAS_METHOD"),
+                         key=lambda m: (m.get("line", 0), m["name"]))
         vnodes.append({
             "id": nid, "name": n["name"], "kind": n["kind"],
             "file": n.get("file", ""), "line": n.get("line", 0),
             "cluster": cl["id"] if cl else "",
             "annotations": n.get("annotations", []),
             "callers": callers_of_type.get(nid, 0),
-            "methods": sorted(m["name"] for m in methods),
-            "inTop": top_links(nid, True), "outTop": top_links(nid, False),
+            "methods": [{"name": m["name"], "line": m.get("line", 0)}
+                        for m in methods],
+            "inAgg": agg_links(nid, True), "outAgg": agg_links(nid, False),
+        })
+    # external library types referenced by the code (gray squares in the UI)
+    ext_callers = defaultdict(Counter)
+    for (a, b, t), w in agg.items():
+        if t == "EXTERNAL":
+            ext_callers[b][g.nodes[a]["name"]] += w
+    for eid in sorted(ext_callers):
+        en = g.nodes[eid]
+        vnodes.append({
+            "id": eid, "name": en["name"], "kind": "External",
+            "file": en.get("qname", ""), "line": 0, "cluster": "",
+            "annotations": [], "callers": sum(ext_callers[eid].values()),
+            "methods": [],
+            "inAgg": [{"name": k, "n": v}
+                      for k, v in ext_callers[eid].most_common(40)],
+            "outAgg": [],
         })
     vedges = [{"src": a, "dst": b, "type": t, "w": w}
               for (a, b, t), w in sorted(agg.items())]
@@ -2649,6 +2668,7 @@ VIZ_HTML = r"""<!DOCTYPE html>
   <select id="flowSel"><option value="">— highlight a flow —</option></select>
   <label class="tgl"><input type="checkbox" id="tCalls" checked> calls</label>
   <label class="tgl"><input type="checkbox" id="tInh" checked> inheritance</label>
+  <label class="tgl"><input type="checkbox" id="tExt"> externals</label>
 </div>
 <canvas id="cv"></canvas>
 <div id="panel"></div>
@@ -2721,6 +2741,18 @@ function tick(){
 let view = {k:1, tx:0, ty:0};
 const toScreen = (x,y)=>[(x*view.k)+W/2+view.tx, (y*view.k)+H/2+view.ty];
 const toWorld  = (sx,sy)=>[(sx-W/2-view.tx)/view.k, (sy-H/2-view.ty)/view.k];
+function fitTo(ids){
+  // zoom the camera so a set of nodes fills the viewport — clicking a node
+  // must show its neighborhood, not bright edges running off-screen
+  const pts=nodes.filter(n=>ids.has(n.id));
+  if(!pts.length)return;
+  let x0=1e9,y0=1e9,x1=-1e9,y1=-1e9;
+  pts.forEach(n=>{x0=Math.min(x0,n.x);y0=Math.min(y0,n.y);
+    x1=Math.max(x1,n.x);y1=Math.max(y1,n.y);});
+  const pad=90, w=(x1-x0)+pad*2, h=(y1-y0)+pad*2;
+  view.k=Math.min(2.2,Math.max(0.3,Math.min(W/w,H/h)));
+  view.tx=-(x0+x1)/2*view.k; view.ty=-(y0+y1)/2*view.k;
+}
 
 // --- interaction ---------------------------------------------------------
 let dragNode=null, panning=false, lastM=null, hover=null, selected=null;
@@ -2756,8 +2788,10 @@ cv.addEventListener('wheel', ev=>{
   view.tx+=ev.offsetX-sx; view.ty+=ev.offsetY-sy;
 },{passive:false});
 function hit(sx,sy){
+  const showExt=document.getElementById('tExt').checked;
   for(let i=nodes.length-1;i>=0;i--){
     const n=nodes[i]; if(hiddenClusters.has(n.cluster))continue;
+    if(n.kind==='External'&&!showExt)continue;
     const [x,y]=toScreen(n.x,n.y);
     const r=n.r*view.k+3;
     if((sx-x)**2+(sy-y)**2<r*r) return n;
@@ -2770,18 +2804,21 @@ function esc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;');}
 function select(n){
   selected=n;
   if(!n){panel.style.display='none';return;}
+  fitTo(neighborsOf(n.id));
+  const agg=x=>'<li>'+esc(x.name)+' <span class="file">×'+x.n+'</span></li>';
   let h='<div class="kind">'+n.kind+(n.annotations.length?
     ' · <span class="anno">@'+n.annotations.join(' @')+'</span>':'')+'</div>'
     +'<h2>'+esc(n.name)+'</h2>'
-    +'<div class="file">'+esc(n.file)+':'+n.line+'</div>'
+    +'<div class="file">'+esc(n.file)+(n.line?':'+n.line:'')+'</div>'
     +'<div class="sec">'+n.callers+' incoming calls · '
     +n.methods.length+' methods</div>';
-  if(n.methods.length) h+='<div class="sec">methods</div><ul>'+
-    n.methods.slice(0,18).map(m=>'<li>'+esc(m)+'()</li>').join('')+'</ul>';
-  if(n.inTop.length) h+='<div class="sec">called by</div><ul>'+
-    n.inTop.map(x=>'<li>'+esc(x)+'</li>').join('')+'</ul>';
-  if(n.outTop.length) h+='<div class="sec">calls</div><ul>'+
-    n.outTop.map(x=>'<li>'+esc(x)+'</li>').join('')+'</ul>';
+  if(n.inAgg.length) h+='<div class="sec">called by ('
+    +n.inAgg.length+' types)</div><ul>'+n.inAgg.map(agg).join('')+'</ul>';
+  if(n.outAgg.length) h+='<div class="sec">calls ('
+    +n.outAgg.length+' types)</div><ul>'+n.outAgg.map(agg).join('')+'</ul>';
+  if(n.methods.length) h+='<div class="sec">methods ('+n.methods.length
+    +')</div><ul>'+n.methods.map(m=>'<li>'+esc(m.name)
+    +'() <span class="file">:'+m.line+'</span></li>').join('')+'</ul>';
   panel.innerHTML=h; panel.style.display='block';
 }
 
@@ -2800,6 +2837,7 @@ flowSel.addEventListener('change',()=>{
   flowPath=f.typeSteps; flowSet=new Set();
   for(let i=0;i<f.typeSteps.length-1;i++)
     flowSet.add(f.typeSteps[i]+'>'+f.typeSteps[i+1]);
+  fitTo(new Set(f.typeSteps));
   panel.innerHTML='<div class="kind">execution flow</div><h2>'+esc(f.label)
     +'</h2><div class="sec">steps</div><ul>'+
     f.steps.map((s,i)=>'<li>'+(i+1)+'. '+esc(s)+'</li>').join('')+'</ul>';
@@ -2827,7 +2865,7 @@ DATA.clusters.forEach(c=>{
 
 // --- render --------------------------------------------------------------
 const EDGE_COLOR={CALLS:'#3d444d',EXTENDS:'#bb8009',IMPLEMENTS:'#8957e5',
-                  PUBLISHES_TO:'#56d4dd'};
+                  PUBLISHES_TO:'#56d4dd',EXTERNAL:'#6e7681'};
 function neighborsOf(id){
   const s=new Set([id]);
   (adj[id]||[]).forEach(e=>{s.add(e.src);s.add(e.dst);});
@@ -2838,43 +2876,66 @@ function frame(){
   ctx.clearRect(0,0,W,H);
   const showCalls=document.getElementById('tCalls').checked;
   const showInh=document.getElementById('tInh').checked;
+  const showExt=document.getElementById('tExt').checked;
   const focus = selected?neighborsOf(selected.id):null;
   // edges
   edges.forEach(e=>{
+    if(e.type==='EXTERNAL'&&!showExt)return;
     const callish=(e.type==='CALLS'||e.type==='PUBLISHES_TO');
     if(callish&&!showCalls)return;
-    if(!callish&&!showInh)return;
+    if(!callish&&e.type!=='EXTERNAL'&&!showInh)return;
     const a=byId[e.src], b=byId[e.dst];
     if(hiddenClusters.has(a.cluster)||hiddenClusters.has(b.cluster))return;
     const [x1,y1]=toScreen(a.x,a.y), [x2,y2]=toScreen(b.x,b.y);
     const onFlow=flowSet&&(flowSet.has(e.src+'>'+e.dst)||flowSet.has(e.dst+'>'+e.src));
+    const inFocus=focus&&focus.has(e.src)&&focus.has(e.dst);
     let alpha_=0.55, color=EDGE_COLOR[e.type]||'#3d444d',
         w=Math.min(4,0.6+Math.sqrt(e.w)*0.5);
     if(flowSet){alpha_=onFlow?0.95:0.08; if(onFlow){color='#ff5252';w=3;}}
-    else if(focus){alpha_=(focus.has(e.src)&&focus.has(e.dst))?0.9:0.07;}
+    else if(focus){alpha_=inFocus?0.9:0.05;}
     ctx.globalAlpha=alpha_; ctx.strokeStyle=color; ctx.lineWidth=w;
+    if(e.type==='EXTERNAL')ctx.setLineDash([4,3]);
     ctx.beginPath(); ctx.moveTo(x1,y1); ctx.lineTo(x2,y2); ctx.stroke();
+    ctx.setLineDash([]);
+    if(inFocus||onFlow){  // direction arrow at the destination end
+      const ang=Math.atan2(y2-y1,x2-x1);
+      const rb=(b.r||5)*view.k+4;
+      const ax=x2-Math.cos(ang)*rb, ay=y2-Math.sin(ang)*rb;
+      ctx.fillStyle=onFlow?'#ff5252':color;
+      ctx.beginPath();
+      ctx.moveTo(ax,ay);
+      ctx.lineTo(ax-8*Math.cos(ang-0.45),ay-8*Math.sin(ang-0.45));
+      ctx.lineTo(ax-8*Math.cos(ang+0.45),ay-8*Math.sin(ang+0.45));
+      ctx.closePath(); ctx.fill();
+    }
   });
   // nodes
   ctx.globalAlpha=1;
   nodes.forEach(n=>{
     if(hiddenClusters.has(n.cluster))return;
+    if(n.kind==='External'&&!showExt)return;
     const [x,y]=toScreen(n.x,n.y);
     if(x<-40||y<-40||x>W+40||y>H+40)return;
-    const r=Math.max(2.5,n.r*view.k);
+    const r=Math.max(3,n.r*view.k);
     const onFlow=flowPath&&flowPath.includes(n.id);
     const matched=searchTerm&&n.name.toLowerCase().includes(searchTerm);
-    let dim = (flowSet&&!onFlow) || (focus&&!focus.has(n.id));
+    const inFocus=focus&&focus.has(n.id);
+    let dim = (flowSet&&!onFlow) || (focus&&!inFocus);
     if(matched)dim=false;
-    ctx.globalAlpha=dim?0.15:1;
-    ctx.beginPath(); ctx.arc(x,y,r,0,7);
-    ctx.fillStyle=clusterColor(n.cluster); ctx.fill();
-    if(n.kind==='Interface'){ctx.strokeStyle='#fff';ctx.lineWidth=1.4;
-      ctx.setLineDash([3,2]);ctx.stroke();ctx.setLineDash([]);}
+    ctx.globalAlpha=dim?0.12:1;
+    if(n.kind==='External'){
+      ctx.fillStyle='#6e7681';
+      ctx.fillRect(x-r,y-r,r*2,r*2);
+    } else {
+      ctx.beginPath(); ctx.arc(x,y,r,0,7);
+      ctx.fillStyle=clusterColor(n.cluster); ctx.fill();
+      if(n.kind==='Interface'){ctx.strokeStyle='#fff';ctx.lineWidth=1.4;
+        ctx.setLineDash([3,2]);ctx.stroke();ctx.setLineDash([]);}
+    }
     if(matched||n===selected||onFlow){
       ctx.strokeStyle=matched?'#f0d50c':(onFlow?'#ff5252':'#fff');
       ctx.lineWidth=2.2; ctx.beginPath(); ctx.arc(x,y,r+2.5,0,7); ctx.stroke();}
-    const showLabel = n===hover||n===selected||matched||onFlow
+    const showLabel = n===hover||n===selected||matched||onFlow||inFocus
       ||view.k>1.1||n.callers>=8;
     if(showLabel&&!dim){
       ctx.fillStyle='#e6edf3'; ctx.font='11px sans-serif';
